@@ -25,37 +25,46 @@ stages:
           - bash: |
               set -euo pipefail
 
-              echo "Checking Kubernetes manifests"
-
               K8S_DIR="$(Build.SourcesDirectory)/K8s"
+
+              echo "Validating raw Kubernetes manifests only"
 
               if [ ! -d "$K8S_DIR" ]; then
                 echo "ERROR: K8s directory not found"
                 exit 1
               fi
 
-              find "$K8S_DIR" -type f \
-                \( -name "*.yaml" -o -name "*.yml" \) -print
-
-              echo "Installing kubectl"
-
               if ! command -v kubectl >/dev/null 2>&1; then
                 KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+
                 curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+
                 chmod +x kubectl
+
                 sudo install kubectl /usr/local/bin/kubectl
               fi
 
-              echo "kubectl version"
+              echo "kubectl version:"
               kubectl version --client
 
-              echo "Validating YAML"
+              echo "Validating Kubernetes YAML files"
 
-              kubectl apply \
-                --dry-run=client \
-                --validate=false \
-                --recursive \
-                -f "$K8S_DIR"
+              while IFS= read -r file; do
+
+                echo "Validating: $file"
+
+                kubectl apply \
+                  --dry-run=client \
+                  --validate=false \
+                  -f "$file"
+
+              done < <(
+                find "$K8S_DIR" \
+                  -type d \( -name helm -o -name .git \) -prune -o \
+                  -type f \( -name "*.yaml" -o -name "*.yml" \) \
+                  ! -name "azuredevoppipeline.yaml" \
+                  -print | sort
+              )
 
               echo "Kubernetes YAML validation successful"
 
@@ -70,7 +79,10 @@ stages:
 
     dependsOn: LintAndValidate
 
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    condition: and(
+      succeeded(),
+      eq(variables['Build.SourceBranch'], 'refs/heads/master')
+    )
 
     jobs:
       - deployment: DeployRobotShop
@@ -99,7 +111,8 @@ stages:
 
                     chmod 600 ~/.ssh/id_rsa
 
-                    ssh-keyscan -H "$(K8S_CP_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
+                    ssh-keyscan -H "$(K8S_CP_HOST)" \
+                      >> ~/.ssh/known_hosts 2>/dev/null
 
                     echo "SSH configuration completed"
 
@@ -155,10 +168,20 @@ stages:
                     ssh "$TARGET" \
                       "sudo kubectl --kubeconfig=$KUBECONFIG create namespace '$NAMESPACE' --dry-run=client -o yaml | sudo kubectl --kubeconfig=$KUBECONFIG apply -f -"
 
-                    echo "Applying Kubernetes manifests"
+                    echo "Applying raw Kubernetes manifests"
 
                     ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG apply --recursive -n '$NAMESPACE' -f '$REMOTE_STAGE_DIR'"
+                      "find '$REMOTE_STAGE_DIR' \
+                      -type d \( -name helm -o -name .git \) -prune -o \
+                      -type f \( -name '*.yaml' -o -name '*.yml' \) \
+                      ! -name 'azuredevoppipeline.yaml' \
+                      -print | sort > /tmp/k8s-manifest-list-$(Build.BuildId).txt"
+
+                    ssh "$TARGET" \
+                      "while IFS= read -r file; do
+                         echo Applying: \$file
+                         sudo kubectl --kubeconfig=$KUBECONFIG apply -n '$NAMESPACE' -f \"\$file\" || exit 1
+                       done < /tmp/k8s-manifest-list-$(Build.BuildId).txt"
 
                     echo "Checking deployment rollout"
 
@@ -182,9 +205,9 @@ stages:
 
                     echo "Cleaning temporary deployment files"
 
-                    ssh "$TARGET" "rm -rf '$REMOTE_STAGE_DIR'"
+                    ssh "$TARGET" \
+                      "rm -rf '$REMOTE_STAGE_DIR' /tmp/k8s-manifest-list-$(Build.BuildId).txt"
 
                     echo "Kubernetes deployment completed successfully"
 
                   displayName: 'Deploy Using kubectl Apply'
-
