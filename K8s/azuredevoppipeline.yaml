@@ -1,14 +1,7 @@
-trigger:
-  branches:
-    include:
-      - master
-      - main
+trigger: none
 
-pr:
-  branches:
-    include:
-      - master
-      - main
+pr: none
+
 
 variables:
   # Create a variable group (e.g., 'robot-shop-helm-cicd') in Azure DevOps Pipelines -> Library
