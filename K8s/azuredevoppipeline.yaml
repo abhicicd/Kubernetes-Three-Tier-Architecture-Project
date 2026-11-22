@@ -3,21 +3,6 @@ trigger: none
 pr: none
 
 
-variables:
-  # Create a variable group (e.g., 'robot-shop-helm-cicd') in Azure DevOps Pipelines -> Library
-  # Expected non-secret variables:
-  #   K8S_CP_HOST: "10.10.1.4"
-  #   K8S_SSH_USER: "azureadmin"
-  #   HELM_CHART_PATH: "K8s/helm"
-  #   HELM_RELEASE_NAME: "robot-shop"
-  #   K8S_NAMESPACE: "robot-shop"
-  #   IMAGE_REPO: "robotshop"
-  #   IMAGE_TAG: "$(Build.BuildId)"
-  #   REDIS_STORAGE_CLASS: "standard"
-  #   ENABLE_NODEPORT: "false"
-  # Expected secret variables:
-  #   K8S_SSH_PRIVATE_KEY  (PEM/OpenSSH private key for K8S_SSH_USER)
-
 pool:
   vmImage: 'ubuntu-latest'
 
