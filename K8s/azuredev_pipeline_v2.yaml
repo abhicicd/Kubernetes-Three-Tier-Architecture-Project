@@ -3,211 +3,156 @@ trigger: none
 pr: none
 
 pool:
-  vmImage: 'ubuntu-latest'
+  vmImage: ubuntu-latest
 
 stages:
+- stage: LintAndValidate
+  displayName: Validate Kubernetes YAML
+  jobs:
+  - job: ValidateK8s
+    displayName: kubectl Dry Run Validation
+    steps:
+    - checkout: self
+      clean: true
 
-  # ==========================================
-  # STAGE 1: VALIDATE KUBERNETES MANIFESTS
-  # ==========================================
+    - bash: |
+        set -euo pipefail
 
-  - stage: LintAndValidate
-    displayName: 'Validate Kubernetes YAML'
+        K8S_DIR="$(Build.SourcesDirectory)/K8s"
 
-    jobs:
-      - job: ValidateK8s
-        displayName: 'kubectl Dry Run Validation'
+        if [ ! -d "$K8S_DIR" ]; then
+          echo "ERROR: K8s directory not found"
+          exit 1
+        fi
 
-        steps:
+        if ! command -v kubectl >/dev/null 2>&1; then
+          VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+          curl -LO "https://dl.k8s.io/release/${VERSION}/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo install kubectl /usr/local/bin/kubectl
+        fi
+
+        echo "Checking Kubernetes manifests"
+
+        COUNT=0
+
+        while IFS= read -r -d '' file; do
+          echo "Validating: $file"
+
+          kubectl apply \
+            --dry-run=client \
+            --validate=false \
+            -f "$file"
+
+          COUNT=$((COUNT + 1))
+        done < <(
+          find "$K8S_DIR" \
+            -type d \( -name helm -o -name .git \) -prune -o \
+            -type f \( -name "*.yaml" -o -name "*.yml" \) \
+            ! -name "azuredevoppipeline.yaml" \
+            -print0
+        )
+
+        if [ "$COUNT" -eq 0 ]; then
+          echo "ERROR: No Kubernetes manifests found"
+          exit 1
+        fi
+
+        echo "Validated $COUNT Kubernetes manifest files"
+
+      displayName: Validate Raw Kubernetes YAML
+
+- stage: DeployToCluster
+  displayName: Deploy to Kubernetes (k8s-cp01)
+  dependsOn: LintAndValidate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+
+  jobs:
+  - deployment: DeployRobotShop
+    displayName: kubectl Apply on Control Plane
+    environment: k8s-three-tier-prod
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
           - checkout: self
             clean: true
 
           - bash: |
               set -euo pipefail
 
-              K8S_DIR="$(Build.SourcesDirectory)/K8s"
+              mkdir -p ~/.ssh
 
-              echo "Validating raw Kubernetes manifests only"
+              printf '%s\n' "$K8S_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa
+              chmod 600 ~/.ssh/id_rsa
 
-              if [ ! -d "$K8S_DIR" ]; then
-                echo "ERROR: K8s directory not found"
-                exit 1
-              fi
+              ssh-keyscan -H "$K8S_CP_HOST" >> ~/.ssh/known_hosts 2>/dev/null
 
-              if ! command -v kubectl >/dev/null 2>&1; then
-                KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
+              echo "SSH configuration completed"
 
-                curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
+            displayName: Configure SSH Access
+            env:
+              K8S_SSH_PRIVATE_KEY: $(K8S_SSH_PRIVATE_KEY)
+              K8S_CP_HOST: $(K8S_CP_HOST)
 
-                chmod +x kubectl
+          - bash: |
+              set -euo pipefail
 
-                sudo install kubectl /usr/local/bin/kubectl
-              fi
+              TARGET="${K8S_SSH_USER}@${K8S_CP_HOST}"
+              REMOTE_DIR="/tmp/k8s-deploy-$(Build.BuildId)"
 
-              echo "kubectl version:"
-              kubectl version --client
+              ssh "$TARGET" "mkdir -p '$REMOTE_DIR'"
 
-              echo "Validating Kubernetes YAML files"
+              scp -r "$(Build.SourcesDirectory)/K8s/." "$TARGET:$REMOTE_DIR/"
 
-              while IFS= read -r file; do
+              echo "Kubernetes manifests copied"
 
-                echo "Validating: $file"
+            displayName: Copy K8s YAML to Control Plane
+            env:
+              K8S_SSH_USER: $(K8S_SSH_USER)
+              K8S_CP_HOST: $(K8S_CP_HOST)
 
-                kubectl apply \
-                  --dry-run=client \
-                  --validate=false \
-                  -f "$file"
+          - bash: |
+              set -euo pipefail
 
-              done < <(
-                find "$K8S_DIR" \
-                  -type d \( -name helm -o -name .git \) -prune -o \
-                  -type f \( -name "*.yaml" -o -name "*.yml" \) \
-                  ! -name "azuredevoppipeline.yaml" \
-                  -print | sort
-              )
+              TARGET="${K8S_SSH_USER}@${K8S_CP_HOST}"
+              REMOTE_DIR="/tmp/k8s-deploy-$(Build.BuildId)"
+              NAMESPACE="$K8S_NAMESPACE"
+              KUBECONFIG="/etc/kubernetes/admin.conf"
 
-              echo "Kubernetes YAML validation successful"
+              echo "Checking Kubernetes nodes"
 
-            displayName: 'Validate Raw Kubernetes YAML'
+              ssh "$TARGET" "sudo kubectl --kubeconfig=$KUBECONFIG get nodes"
 
-  # ==========================================
-  # STAGE 2: DEPLOY TO KUBERNETES
-  # ==========================================
+              echo "Creating namespace"
 
-  - stage: DeployToCluster
-    displayName: 'Deploy to Kubernetes (k8s-cp01)'
+              ssh "$TARGET" "sudo kubectl --kubeconfig=$KUBECONFIG create namespace '$NAMESPACE' --dry-run=client -o yaml | sudo kubectl --kubeconfig=$KUBECONFIG apply -f -"
 
-    dependsOn: LintAndValidate
+              echo "Applying raw Kubernetes manifests"
 
-    condition: and(
-      succeeded(),
-      eq(variables['Build.SourceBranch'], 'refs/heads/master')
-    )
+              ssh "$TARGET" "find '$REMOTE_DIR' -type d \( -name helm -o -name .git \) -prune -o -type f \( -name '*.yaml' -o -name '*.yml' \) ! -name 'azuredevoppipeline.yaml' -print | sort > /tmp/k8s-manifests-$(Build.BuildId).txt"
 
-    jobs:
-      - deployment: DeployRobotShop
-        displayName: 'kubectl Apply on Control Plane'
+              ssh "$TARGET" "while IFS= read -r file; do echo Applying: \$file; sudo kubectl --kubeconfig=$KUBECONFIG apply -n '$NAMESPACE' -f \"\$file\" || exit 1; done < /tmp/k8s-manifests-$(Build.BuildId).txt"
 
-        environment: 'k8s-three-tier-prod'
+              echo "Checking deployment rollout"
 
-        strategy:
-          runOnce:
-            deploy:
-              steps:
+              ssh "$TARGET" "sudo kubectl --kubeconfig=$KUBECONFIG rollout status deployment --all -n '$NAMESPACE' --timeout=300s"
 
-                - checkout: self
-                  clean: true
+              echo "Checking pods"
 
-                # =================================
-                # STEP 1: SSH CONFIGURATION
-                # =================================
+              ssh "$TARGET" "sudo kubectl --kubeconfig=$KUBECONFIG get pods -n '$NAMESPACE' -o wide"
 
-                - bash: |
-                    set -euo pipefail
+              echo "Checking services"
 
-                    mkdir -p ~/.ssh
+              ssh "$TARGET" "sudo kubectl --kubeconfig=$KUBECONFIG get services -n '$NAMESPACE'"
 
-                    printf '%s\n' "$(K8S_SSH_PRIVATE_KEY)" > ~/.ssh/id_rsa
+              echo "Deployment completed successfully"
 
-                    chmod 600 ~/.ssh/id_rsa
+              ssh "$TARGET" "rm -rf '$REMOTE_DIR' /tmp/k8s-manifests-$(Build.BuildId).txt"
 
-                    ssh-keyscan -H "$(K8S_CP_HOST)" \
-                      >> ~/.ssh/known_hosts 2>/dev/null
-
-                    echo "SSH configuration completed"
-
-                  displayName: 'Configure SSH Access'
-
-                # =================================
-                # STEP 2: COPY K8S MANIFESTS
-                # =================================
-
-                - bash: |
-                    set -euo pipefail
-
-                    REMOTE_STAGE_DIR="/tmp/k8s-deploy-$(Build.BuildId)"
-
-                    TARGET="$(K8S_SSH_USER)@$(K8S_CP_HOST)"
-
-                    echo "Creating remote directory"
-
-                    ssh "$TARGET" "mkdir -p '$REMOTE_STAGE_DIR'"
-
-                    echo "Copying Kubernetes manifests"
-
-                    scp -r \
-                      "$(Build.SourcesDirectory)/K8s/." \
-                      "$TARGET:$REMOTE_STAGE_DIR/"
-
-                    echo "Kubernetes manifests copied successfully"
-
-                  displayName: 'Copy K8s YAML to Control Plane'
-
-                # =================================
-                # STEP 3: APPLY KUBERNETES YAML
-                # =================================
-
-                - bash: |
-                    set -euo pipefail
-
-                    TARGET="$(K8S_SSH_USER)@$(K8S_CP_HOST)"
-
-                    REMOTE_STAGE_DIR="/tmp/k8s-deploy-$(Build.BuildId)"
-
-                    NAMESPACE="$(K8S_NAMESPACE)"
-
-                    KUBECONFIG="/etc/kubernetes/admin.conf"
-
-                    echo "Checking Kubernetes cluster"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG get nodes"
-
-                    echo "Creating Kubernetes namespace"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG create namespace '$NAMESPACE' --dry-run=client -o yaml | sudo kubectl --kubeconfig=$KUBECONFIG apply -f -"
-
-                    echo "Applying raw Kubernetes manifests"
-
-                    ssh "$TARGET" \
-                      "find '$REMOTE_STAGE_DIR' \
-                      -type d \( -name helm -o -name .git \) -prune -o \
-                      -type f \( -name '*.yaml' -o -name '*.yml' \) \
-                      ! -name 'azuredevoppipeline.yaml' \
-                      -print | sort > /tmp/k8s-manifest-list-$(Build.BuildId).txt"
-
-                    ssh "$TARGET" \
-                      "while IFS= read -r file; do
-                         echo Applying: \$file
-                         sudo kubectl --kubeconfig=$KUBECONFIG apply -n '$NAMESPACE' -f \"\$file\" || exit 1
-                       done < /tmp/k8s-manifest-list-$(Build.BuildId).txt"
-
-                    echo "Checking deployment rollout"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG rollout status deployment --all -n '$NAMESPACE' --timeout=300s"
-
-                    echo "Checking pods"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG get pods -n '$NAMESPACE' -o wide"
-
-                    echo "Checking services"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG get services -n '$NAMESPACE'"
-
-                    echo "Checking deployments"
-
-                    ssh "$TARGET" \
-                      "sudo kubectl --kubeconfig=$KUBECONFIG get deployments -n '$NAMESPACE'"
-
-                    echo "Cleaning temporary deployment files"
-
-                    ssh "$TARGET" \
-                      "rm -rf '$REMOTE_STAGE_DIR' /tmp/k8s-manifest-list-$(Build.BuildId).txt"
-
-                    echo "Kubernetes deployment completed successfully"
-
-                  displayName: 'Deploy Using kubectl Apply'
+            displayName: Deploy Using kubectl Apply
+            env:
+              K8S_SSH_USER: $(K8S_SSH_USER)
+              K8S_CP_HOST: $(K8S_CP_HOST)
+              K8S_NAMESPACE: $(K8S_NAMESPACE)
