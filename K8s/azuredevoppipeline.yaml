@@ -1,0 +1,105 @@
+trigger:
+  branches:
+    include:
+      - master
+      - main
+
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+variables:
+  # Create a variable group (e.g., 'robot-shop-helm-cicd') in Azure DevOps Pipelines -> Library
+  # Expected non-secret variables:
+  #   K8S_CP_HOST: "10.10.1.4"
+  #   K8S_SSH_USER: "azureadmin"
+  #   HELM_CHART_PATH: "K8s/helm"
+  #   HELM_RELEASE_NAME: "robot-shop"
+  #   K8S_NAMESPACE: "robot-shop"
+  #   IMAGE_REPO: "robotshop"
+  #   IMAGE_TAG: "$(Build.BuildId)"
+  #   REDIS_STORAGE_CLASS: "standard"
+  #   ENABLE_NODEPORT: "false"
+  # Expected secret variables:
+  #   K8S_SSH_PRIVATE_KEY  (PEM/OpenSSH private key for K8S_SSH_USER)
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  - stage: LintAndValidate
+    displayName: 'Lint & Validate Helm Chart'
+    jobs:
+      - job: ValidateChart
+        displayName: 'Helm Lint & Template Dry-Run'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: HelmInstaller@1
+            displayName: 'Install Helm'
+            inputs:
+              helmVersionToInstall: 'latest'
+
+          - script: |
+              set -euo pipefail
+              helm lint "$(HELM_CHART_PATH)"
+              helm template "$(HELM_RELEASE_NAME)" "$(HELM_CHART_PATH)" \
+                --namespace "$(K8S_NAMESPACE)" \
+                --set image.repo="$(IMAGE_REPO)" \
+                --set image.version="$(IMAGE_TAG)" \
+                --set image.pullPolicy="IfNotPresent" \
+                --set nodeport="$(ENABLE_NODEPORT)" \
+                --set redis.storageClassName="$(REDIS_STORAGE_CLASS)" > /dev/null
+              echo "Helm lint and template validation succeeded."
+            displayName: 'Run helm lint and helm template'
+
+  - stage: DeployToCluster
+    displayName: 'Deploy to Kubernetes (k8s-cp01)'
+    dependsOn: LintAndValidate
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+    jobs:
+      - deployment: DeployRobotShop
+        displayName: 'Helm Upgrade --Install on Control Plane'
+        environment: 'k8s-three-tier-prod'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                  clean: true
+
+                - task: HelmInstaller@1
+                  displayName: 'Install Helm on Agent'
+                  inputs:
+                    helmVersionToInstall: 'latest'
+
+                - script: |
+                    set -euo pipefail
+                    mkdir -p ~/.ssh
+                    printf '%s\n' "$(K8S_SSH_PRIVATE_KEY)" > ~/.ssh/id_rsa
+                    chmod 600 ~/.ssh/id_rsa
+                    ssh-keyscan -H "$(K8S_CP_HOST)" >> ~/.ssh/known_hosts 2>/dev/null
+
+                    REMOTE_STAGE_DIR="/tmp/helm-deploy-$(Build.BuildId)"
+                    ssh "$(K8S_SSH_USER)@$(K8S_CP_HOST)" "mkdir -p '${REMOTE_STAGE_DIR}'"
+                    scp -r "$(HELM_CHART_PATH)/." "$(K8S_SSH_USER)@$(K8S_CP_HOST):'${REMOTE_STAGE_DIR}/'"
+
+                    ssh "$(K8S_SSH_USER)@$(K8S_CP_HOST)" "
+                      set -euo pipefail
+                      export KUBECONFIG=\${KUBECONFIG:-/etc/kubernetes/admin.conf}
+                      kubectl create namespace '$(K8S_NAMESPACE)' --dry-run=client -o yaml | kubectl apply -f -
+                      helm upgrade --install '$(HELM_RELEASE_NAME)' '${REMOTE_STAGE_DIR}' \
+                        --namespace '$(K8S_NAMESPACE)' \
+                        --set image.repo='$(IMAGE_REPO)' \
+                        --set image.version='$(IMAGE_TAG)' \
+                        --set image.pullPolicy='IfNotPresent' \
+                        --set nodeport='$(ENABLE_NODEPORT)' \
+                        --set redis.storageClassName='$(REDIS_STORAGE_CLASS)' \
+                        --timeout 10m
+                      kubectl get pods -n '$(K8S_NAMESPACE)' -o wide
+                      rm -rf '${REMOTE_STAGE_DIR}'
+                    "
+                  displayName: 'Deploy Helm chart to k8s-cp01'
